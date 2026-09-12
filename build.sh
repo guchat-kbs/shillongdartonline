@@ -27,12 +27,4 @@ else:
     )
     print('Superuser sakal created successfully.')
 "
-
-python manage.py shell -c "
-from entries.models import Entry
-
-deleted_count = Entry.objects.filter(owner__isnull=True).count()
-print(f'Deleting {deleted_count} orphaned entries...')
-Entry.objects.filter(owner__isnull=True).delete()
-"
 ```
