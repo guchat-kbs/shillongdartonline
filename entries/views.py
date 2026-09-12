@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db.models import Count, Q, Sum
 from django.shortcuts import redirect, render
 from django.utils import timezone
@@ -51,7 +53,7 @@ def entries_api(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        entries = (
+        entries = list(
             Entry.objects
             .filter(
                 business_date=today,
@@ -63,11 +65,12 @@ def entries_api(request):
 
         serializer = EntrySerializer(entries, many=True)
 
-        total = (
-            entries.aggregate(
-                total=Sum("amount")
-            )["total"]
-            or 0
+        # Sum in Python from the rows we already fetched instead of
+        # issuing a second SUM(...) query — one DB round trip
+        # instead of two.
+        total = sum(
+            (entry.amount for entry in entries),
+            Decimal("0"),
         )
 
         return Response({
@@ -99,7 +102,7 @@ def entries_api(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    created_entries = []
+    created_items = []
 
     for item in data:
 
@@ -121,8 +124,20 @@ def entries_api(request):
 
         serializer.is_valid(raise_exception=True)
 
-        created_entries.append(
-            serializer.save(owner=request.user)
+        created_items.append(
+            Entry(
+                owner=request.user,
+                entry_type=entry_type,
+                number=serializer.validated_data["number"],
+                amount=serializer.validated_data["amount"],
+                business_date=today,
+            )
+        )
+
+    with transaction.atomic():
+
+        created_entries = Entry.objects.bulk_create(
+            created_items
         )
 
     return Response(
@@ -387,64 +402,44 @@ def master_total_api(request):
         .values_list("id", flat=True)
     )
 
-    # Per-number breakdown.
+    base_qs = Entry.objects.filter(
+        business_date=today,
+        owner_id__in=normal_user_ids,
+    )
+
+    # Per-number breakdown, computed in the database with a single
+    # GROUP BY instead of pulling every row and summing in Python.
     # Only numbers that actually have entries are returned.
-    by_number = {}
-
-    type_entries = (
-        Entry.objects
-        .filter(
-            business_date=today,
-            entry_type=entry_type,
-            owner_id__in=normal_user_ids,
+    number_breakdown = (
+        base_qs
+        .filter(entry_type=entry_type)
+        .values("number")
+        .annotate(
+            total_amount=Sum("amount"),
+            total_entries=Count("id"),
         )
-        .values_list("number", "amount")
     )
 
-    total = 0
+    by_number = {
+        row["number"].strip().zfill(2): {
+            "total_amount": row["total_amount"] or 0,
+            "total_entries": row["total_entries"],
+        }
+        for row in number_breakdown
+    }
 
-    for number, amount in type_entries:
-
-        padded = number.strip().zfill(2)
-
-        if padded not in by_number:
-            by_number[padded] = {
-                "total_amount": 0,
-                "total_entries": 0,
-            }
-
-        by_number[padded]["total_amount"] += amount
-        by_number[padded]["total_entries"] += 1
-
-        total += amount
-
-    fr_total = (
-        Entry.objects
-        .filter(
-            business_date=today,
-            entry_type="FR",
-            owner_id__in=normal_user_ids,
-        )
-        .aggregate(
-            total=Sum("amount")
-        )["total"]
-        or 0
+    # FR and SR totals in a single query via conditional aggregation,
+    # instead of two separate round trips.
+    totals = base_qs.aggregate(
+        fr_total=Sum("amount", filter=Q(entry_type="FR")),
+        sr_total=Sum("amount", filter=Q(entry_type="SR")),
     )
 
-    sr_total = (
-        Entry.objects
-        .filter(
-            business_date=today,
-            entry_type="SR",
-            owner_id__in=normal_user_ids,
-        )
-        .aggregate(
-            total=Sum("amount")
-        )["total"]
-        or 0
-    )
-
+    fr_total = totals["fr_total"] or 0
+    sr_total = totals["sr_total"] or 0
     overall_total = fr_total + sr_total
+
+    total = fr_total if entry_type == "FR" else sr_total
 
     return Response({
         "entry_type": entry_type,
