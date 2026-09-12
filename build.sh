@@ -17,7 +17,7 @@ email = "sakalytshit@gmail.com"
 password = "Salibill1"
 
 if User.objects.filter(username=username).exists():
-    print("Superbase already there")
+    print("Superuser already there")
 else:
     User.objects.create_superuser(
         username=username,
